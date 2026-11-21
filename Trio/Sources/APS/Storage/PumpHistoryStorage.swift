@@ -68,7 +68,12 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
         return try await context.perform {
             // upsert candidates: dose syncIdentifier, timestamp+type as fallback
             // LoopKit derives dose.syncIdentifier from raw; empty raw must not become a shared identity
-            let syncIdentifiers = events.compactMap(\.dose?.syncIdentifier).filter { !$0.isEmpty }
+            func stableIdentity(_ event: NewPumpEvent) -> String? {
+                if let identifier = event.dose?.syncIdentifier, !identifier.isEmpty { return identifier }
+                guard event.raw.starts(with: Data("apex:".utf8)), !event.raw.isEmpty else { return nil }
+                return event.raw.map { String(format: "%02x", $0) }.joined()
+            }
+            let syncIdentifiers = events.compactMap(stableIdentity)
             let timestamps = events.map(\.date)
             let request = PumpEventStored.fetchRequest() as NSFetchRequest<PumpEventStored>
             request.predicate = NSCompoundPredicate(orPredicateWithSubpredicates: [
@@ -111,15 +116,21 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     type: storedType.rawValue,
                     isScheduledBasal: event.type == .basal
                 )
-                let syncIdentifier = event.dose?.syncIdentifier.flatMap { $0.isEmpty ? nil : $0 }
+                let syncIdentifier = stableIdentity(event)
+                let isWalnutEvent = String(decoding: event.raw, as: UTF8.self).hasPrefix("apex:")
                 let match = syncIdentifier.flatMap { bySyncIdentifier[$0] }
-                    ?? byTimestampAndType[fallbackKey]
+                    ?? (isWalnutEvent && syncIdentifier != nil ? nil : byTimestampAndType[fallbackKey])
 
                 if let match = match {
                     assertedRows.insert(match.objectID)
-                    // finalized rows never change
-                    if match.isMutable, let dose = event.dose {
-                        self.updateMutablePumpEvent(match, with: dose)
+                    // Walnut's stable identity permits a confirmed readback to correct an
+                    // already finalized row; timestamp-only fallback remains immutable.
+                    if let dose = event.dose, match.isMutable || (isWalnutEvent && syncIdentifier != nil && !dose.isMutable) {
+                        self.updateMutablePumpEvent(
+                            match,
+                            with: dose,
+                            allowFinalCorrection: isWalnutEvent && syncIdentifier != nil
+                        )
                     }
                     continue
                 }
@@ -148,11 +159,11 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     newBolusEntry.pumpEvent = newPumpEvent
                     newBolusEntry.amount = NSDecimalNumber(decimal: self.roundDose(
                         dose.unitsInDeliverableIncrements,
-                        toIncrement: Double(self.settings.preferences.bolusIncrement)
+                        toIncrement: isWalnutEvent ? 0.025 : Double(self.settings.preferences.bolusIncrement)
                     ))
                     newBolusEntry.programmedAmount = NSDecimalNumber(decimal: self.roundDose(
                         dose.programmedUnits,
-                        toIncrement: Double(self.settings.preferences.bolusIncrement)
+                        toIncrement: isWalnutEvent ? 0.025 : Double(self.settings.preferences.bolusIncrement)
                     ))
                     newBolusEntry.isExternal = dose.manuallyEntered
                     newBolusEntry.isSMB = dose.automatic ?? true
@@ -244,20 +255,31 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
     /// Finalized reports freeze the row with delivered values. If NS-visible
     /// values changed on an already-uploaded row, the upload flag resets and
     /// the re-POST replaces the NS document in place.
-    private func updateMutablePumpEvent(_ event: PumpEventStored, with dose: DoseEntry) {
+    private func updateMutablePumpEvent(
+        _ event: PumpEventStored,
+        with dose: DoseEntry,
+        allowFinalCorrection: Bool = false
+    ) {
         switch event.type {
         case PumpEventStored.EventType.bolus.rawValue:
             guard let bolus = event.bolus else { return }
             let previousAmount = bolus.amount
+            let previousIsSMB = bolus.isSMB
+            let previousIsMutable = event.isMutable
             let finalAmount = dose.deliveredUnits.map {
-                self.roundDose($0, toIncrement: Double(settings.preferences.bolusIncrement))
+                self.roundDose($0, toIncrement: allowFinalCorrection ? 0.025 : Double(settings.preferences.bolusIncrement))
             }
             if let finalAmount = finalAmount {
                 bolus.amount = finalAmount as NSDecimalNumber
             }
             bolus.isSMB = dose.automatic ?? true
             event.isMutable = dose.isMutable
+            let deliveryChanged = bolus.amount != previousAmount || bolus.isSMB != previousIsSMB ||
+                event.isMutable != previousIsMutable
             if event.isUploadedToNS, bolus.amount != previousAmount {
+                event.isUploadedToNS = false
+            }
+            if allowFinalCorrection, deliveryChanged {
                 event.isUploadedToNS = false
             }
             if !dose.isMutable {
@@ -268,6 +290,11 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
             guard let tempBasal = event.tempBasal else { return }
             let previousRate = tempBasal.rate
             let previousDuration = tempBasal.duration
+            let previousDeliveredUnits = tempBasal.deliveredUnits
+            let previousStart = tempBasal.startDate
+            let previousEnd = tempBasal.endDate
+            let previousIsScheduled = tempBasal.isScheduledBasal
+            let previousIsMutable = event.isMutable
             // The dose says what this is; the row's own flag is stale exactly when it matters,
             // and reading it back would let a schedule report keep a temp basal's identity —
             // and with it a 24 h placeholder span read as delivery.
@@ -280,7 +307,14 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
             tempBasal.endDate = span.end
             tempBasal.deliveredUnits = dose.deliveredUnits.map { Decimal($0) as NSDecimalNumber }
             event.isMutable = dose.isMutable
+            let deliveryChanged = tempBasal.rate != previousRate || tempBasal.duration != previousDuration ||
+                tempBasal.deliveredUnits != previousDeliveredUnits || tempBasal.startDate != previousStart ||
+                tempBasal.endDate != previousEnd || tempBasal.isScheduledBasal != previousIsScheduled ||
+                event.isMutable != previousIsMutable
             if event.isUploadedToNS, tempBasal.rate != previousRate || tempBasal.duration != previousDuration {
+                event.isUploadedToNS = false
+            }
+            if allowFinalCorrection, deliveryChanged {
                 event.isUploadedToNS = false
             }
             if !dose.isMutable {

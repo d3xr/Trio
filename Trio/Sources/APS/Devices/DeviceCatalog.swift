@@ -438,6 +438,14 @@ extension DeviceCatalog {
             reportsRewindEvents: true
         ),
         PumpCatalogEntry(
+            WalnutPumpManager.self,
+            manufacturer: .otherSources,
+            name: "Walnut",
+            legacyIdentifierPrefixes: [WalnutPumpManager.legacyPluginIdentifier],
+            basalCapability: BasalRateCapability(supportedRates: WalnutPumpManager.onboardingSupportedBasalRates),
+            reportsRewindEvents: true
+        ),
+        PumpCatalogEntry(
             MockPumpManager.self,
             manufacturer: .simulator,
             name: String(localized: "Pump Simulator", comment: "Simulated pump in the device picker"),

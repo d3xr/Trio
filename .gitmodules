@@ -48,3 +48,6 @@
 [submodule "LoopAlgorithm"]
 	path = LoopAlgorithm
 	url = https://github.com/loopandlearn/LoopAlgorithm.git
+[submodule "Walnut"]
+	path = Vendor/Walnut
+	url = https://github.com/d3xr/walnut-driver.git

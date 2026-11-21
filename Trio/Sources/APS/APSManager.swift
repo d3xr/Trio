@@ -51,6 +51,29 @@ protocol BolusFailureObserver {
     func bolusDidFail()
 }
 
+struct WalnutDeterminationContext {
+    let manager: WalnutPumpManager
+    let instanceID: UUID
+    let decisionRevision: Int
+
+    init?(pump: PumpManager?) {
+        guard let manager = pump as? WalnutPumpManager else { return nil }
+        self.manager = manager
+        instanceID = manager.instanceID
+        decisionRevision = manager.decisionRevision
+    }
+
+    func validatedManager(for pump: PumpManager?) throws -> WalnutPumpManager {
+        guard let current = pump as? WalnutPumpManager,
+              current === manager,
+              current.instanceID == instanceID
+        else {
+            throw APSError.invalidPumpState(message: String(localized: "Pump changed before the decision was enacted"))
+        }
+        return current
+    }
+}
+
 enum APSError: LocalizedError {
     case pumpError(Error)
     case invalidPumpState(message: String)
@@ -376,11 +399,12 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     private func executeLoop(loopStatRecord: inout LoopStats) async throws {
+        let walnutContext = WalnutDeterminationContext(pump: pumpManager)
         try await determineBasal()
 
         // Closed loop: also enact the determination.
         if settings.dosingMode.automation != .off {
-            try await enactDetermination()
+            try await enactDetermination(walnutContext: walnutContext)
         }
 
         let endDate = Date()
@@ -770,7 +794,7 @@ final class BaseAPSManager: APSManager, Injectable {
         }
     }
 
-    private func enactDetermination() async throws {
+    private func enactDetermination(walnutContext: WalnutDeterminationContext?) async throws {
         guard let determinationID = try await determinationStorage
             .fetchLastDeterminationObjectID(predicate: NSPredicate.predicateFor30MinAgoForDetermination).first
         else {
@@ -780,8 +804,12 @@ final class BaseAPSManager: APSManager, Injectable {
         guard let pump = pumpManager else {
             throw APSError.apsError(message: "Pump not set")
         }
+        guard walnutContext != nil || !(pump is WalnutPumpManager) else {
+            throw APSError.invalidPumpState(message: String(localized: "Pump changed before the decision was enacted"))
+        }
+        let activePump: PumpManager = try walnutContext?.validatedManager(for: pump) ?? pump
 
-        if pump.status.pumpStatus.suspended {
+        if activePump.status.pumpStatus.suspended {
             debug(.apsManager, "Skipping enactDetermination because pump is suspended")
             return
         }
@@ -794,12 +822,12 @@ final class BaseAPSManager: APSManager, Injectable {
         let (rateDecimal, durationInSeconds, smbToDeliver) = try await setValues(determinationID: determinationID)
 
         if let rate = rateDecimal, let duration = durationInSeconds {
-            try await performBasal(pump: pump, rate: rate, duration: duration)
+            try await performBasal(pump: activePump, rate: rate, duration: duration, walnutContext: walnutContext)
         }
 
         // only perform a bolus if smbToDeliver is > 0
         if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending {
-            try await performBolus(pump: pump, smbToDeliver: smb)
+            try await performBolus(pump: activePump, smbToDeliver: smb, walnutContext: walnutContext)
         }
     }
 
@@ -823,18 +851,37 @@ final class BaseAPSManager: APSManager, Injectable {
         }
     }
 
-    private func performBasal(pump: PumpManager, rate: NSDecimalNumber, duration: TimeInterval) async throws {
+    private func performBasal(
+        pump: PumpManager,
+        rate: NSDecimalNumber,
+        duration: TimeInterval,
+        walnutContext: WalnutDeterminationContext?
+    ) async throws {
         // the algorithm already floored this against the pump's own table, so don't floor it
         // again here: the Decimal -> Double hop can land a hair low and cost a whole increment
         let unitsPerHour = rate.decimalValue.nearestDouble
         if pump.roundToSupportedBasalRate(unitsPerHour: unitsPerHour) != unitsPerHour {
             debug(.apsManager, "Temp basal \(unitsPerHour) U/hr is not on the pump's rate table")
         }
-        try await pump.enactTempBasal(unitsPerHour: unitsPerHour, for: duration)
+        let validatedPump = try walnutContext?.validatedManager(for: pumpManager) ?? pump
+        try await validatedPump.enactTempBasal(
+            unitsPerHour: unitsPerHour,
+            for: duration,
+            expectedDecisionRevision: walnutContext?.decisionRevision
+        )
     }
 
-    private func performBolus(pump: PumpManager, smbToDeliver: NSDecimalNumber) async throws {
-        try await pump.enactBolus(units: smbToDeliver.decimalValue.nearestDouble, automatic: true)
+    private func performBolus(
+        pump: PumpManager,
+        smbToDeliver: NSDecimalNumber,
+        walnutContext: WalnutDeterminationContext?
+    ) async throws {
+        let validatedPump = try walnutContext?.validatedManager(for: pumpManager) ?? pump
+        try await validatedPump.enactBolus(
+            units: smbToDeliver.decimalValue.nearestDouble,
+            automatic: true,
+            expectedDecisionRevision: walnutContext?.decisionRevision
+        )
         bolusProgress.send(0)
     }
 
@@ -1431,9 +1478,13 @@ final class BaseAPSManager: APSManager, Injectable {
 }
 
 private extension PumpManager {
-    func enactTempBasal(unitsPerHour: Double, for duration: TimeInterval) async throws {
+    func enactTempBasal(
+        unitsPerHour: Double,
+        for duration: TimeInterval,
+        expectedDecisionRevision: Int? = nil
+    ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            self.enactTempBasal(unitsPerHour: unitsPerHour, for: duration) { error in
+            let completion: (PumpManagerError?) -> Void = { error in
                 if let error = error {
                     debug(.apsManager, "Temp basal failed: \(unitsPerHour) for: \(duration)")
                     continuation.resume(throwing: error)
@@ -1442,14 +1493,24 @@ private extension PumpManager {
                     continuation.resume(returning: ())
                 }
             }
+            if let expectedDecisionRevision, let walnut = self as? WalnutPumpManager {
+                walnut.enactTempBasal(
+                    unitsPerHour: unitsPerHour,
+                    for: duration,
+                    expectedDecisionRevision: expectedDecisionRevision,
+                    completion: completion
+                )
+            } else {
+                self.enactTempBasal(unitsPerHour: unitsPerHour, for: duration, completion: completion)
+            }
         }
     }
 
-    func enactBolus(units: Double, automatic: Bool) async throws {
+    func enactBolus(units: Double, automatic: Bool, expectedDecisionRevision: Int? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let automaticValue = automatic ? BolusActivationType.automatic : BolusActivationType.manualRecommendationAccepted
 
-            self.enactBolus(units: units, activationType: automaticValue) { error in
+            let completion: (PumpManagerError?) -> Void = { error in
                 if let error = error {
                     debug(.apsManager, "Bolus failed: \(units)")
                     continuation.resume(throwing: error)
@@ -1457,6 +1518,16 @@ private extension PumpManager {
                     debug(.apsManager, "Bolus succeeded: \(units)")
                     continuation.resume(returning: ())
                 }
+            }
+            if let expectedDecisionRevision, let walnut = self as? WalnutPumpManager {
+                walnut.enactBolus(
+                    units: units,
+                    activationType: automaticValue,
+                    expectedDecisionRevision: expectedDecisionRevision,
+                    completion: completion
+                )
+            } else {
+                self.enactBolus(units: units, activationType: automaticValue, completion: completion)
             }
         }
     }

@@ -69,11 +69,28 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
     @SyncAccess var loopInProgress: Bool = false
 
     var pumpManager: PumpManagerUI? {
+        get { accessLock.withLock { pumpManagerValue } }
+        set { accessLock.withLock { pumpManagerValue = newValue } }
+    }
+
+    private var pumpManagerValue: PumpManagerUI? {
         didSet {
             if let oldValue = oldValue {
                 trioAlertManager?.unregister(managerIdentifier: oldValue.pluginIdentifier)
             }
-            if let pumpManager = pumpManager {
+            if let pumpManager = pumpManagerValue {
+                if let walnut = pumpManager as? WalnutPumpManager {
+                    walnut.trioBasalScheduleProvider = { [weak self] in
+                        guard let self else { return nil }
+                        let entries = self.storage.retrieve(
+                            OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self
+                        ) ?? [BasalProfileEntry](from: OpenAPS.defaults(for: OpenAPS.Settings.basalProfile)) ?? []
+                        guard !entries.isEmpty else { return nil }
+                        return BasalRateSchedule(dailyItems: entries.map {
+                            RepeatingScheduleValue(startTime: TimeInterval($0.minutes * 60), value: Double($0.rate))
+                        })
+                    }
+                }
                 pumpManager.pumpManagerDelegate = self
                 pumpManager.delegateQueue = processQueue
 
@@ -232,10 +249,9 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
     }
 
     func setupPumpManager() {
-        if let pumpManagerRawValue = rawPumpManager ?? UserDefaults.standard.legacyPumpManagerRawValue {
-            pumpManager = pumpManagerFromRawValue(pumpManagerRawValue)
-        } else {
-            pumpManager = nil
+        accessLock.withLock {
+            let saved = rawPumpManager ?? UserDefaults.standard.legacyPumpManagerRawValue
+            pumpManager = saved.flatMap { pumpManagerFromRawValue($0) }
         }
     }
 
@@ -344,11 +360,49 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManager(
-        _: LoopKit.PumpManager,
-        didRequestBasalRateScheduleChange _: LoopKit.BasalRateSchedule,
-        completion _: @escaping (Error?) -> Void
+        _ manager: LoopKit.PumpManager,
+        didRequestBasalRateScheduleChange schedule: LoopKit.BasalRateSchedule,
+        completion: @escaping (Error?) -> Void
     ) {
-        debug(.deviceManager, "pumpManagerBasalRateChange")
+        guard manager is WalnutPumpManager else {
+            debug(.deviceManager, "pumpManagerBasalRateChange")
+            return
+        }
+        dispatchPrecondition(condition: .onQueue(processQueue))
+        let items = schedule.items
+        guard pumpManager === manager, items.count <= 48, items.first?.startTime == 0,
+              zip(items, items.dropFirst()).allSatisfy({ $0.startTime < $1.startTime }),
+              items.allSatisfy({
+                  $0.startTime.isFinite && (0 ..< 86400).contains($0.startTime) &&
+                      $0.startTime.truncatingRemainder(dividingBy: 1800) == 0 &&
+                      $0.value.isFinite && $0.value > 0
+              })
+        else {
+            completion(WalnutManagerError.message(String(localized: "Unable to adopt the pump's basal schedule")))
+            return
+        }
+
+        let profile = items.map { item in
+            let minutes = Int(item.startTime / 60)
+            return BasalProfileEntry(
+                start: String(format: "%02d:%02d:00", minutes / 60, minutes % 60),
+                minutes: minutes,
+                rate: Decimal(item.value)
+            )
+        }
+        var saved = false
+        storage.transaction { storage in
+            storage.save(profile, as: OpenAPS.Settings.basalProfile)
+            saved = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) == profile
+        }
+        guard saved else {
+            completion(WalnutManagerError.message(String(localized: "Unable to save the basal schedule")))
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.broadcaster.notify(BasalProfileObserver.self, on: .main) { $0.basalProfileDidChange(profile) }
+        }
+        completion(nil)
     }
 
     func pumpManagerPumpWasReplaced(_: PumpManager) {
@@ -365,11 +419,14 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManagerDidUpdateState(_ pumpManager: PumpManager) {
-        rawPumpManager = pumpManager.rawValue
-        if self.pumpManager == nil, let newPumpManager = pumpManager as? PumpManagerUI {
-            self.pumpManager = newPumpManager
+        accessLock.withLock {
+            guard !(pumpManager is WalnutPumpManager) || pumpManagerValue === pumpManager else { return }
+            rawPumpManager = pumpManager.rawValue
+            if pumpManagerValue == nil, let newPumpManager = pumpManager as? PumpManagerUI {
+                pumpManagerValue = newPumpManager
+            }
+            pumpName.send(pumpManager.localizedTitle)
         }
-        pumpName.send(pumpManager.localizedTitle)
     }
 
     /// heartbeat with pump occurs some issues in the backgroundtask - so never used
@@ -425,6 +482,7 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
 
     func pumpManager(_ pumpManager: PumpManager, didUpdate status: PumpManagerStatus, oldStatus: PumpManagerStatus) {
         dispatchPrecondition(condition: .onQueue(processQueue))
+        guard !(pumpManager is WalnutPumpManager) || self.pumpManager === pumpManager else { return }
         debug(.deviceManager, "New pump status Bolus: \(status.bolusState)")
         debug(.deviceManager, "New pump status Basal: \(String(describing: status.basalDeliveryState))")
 
@@ -520,9 +578,18 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
         }
     }
 
-    func pumpManagerWillDeactivate(_: PumpManager) {
+    func pumpManagerWillDeactivate(_ manager: PumpManager) {
         dispatchPrecondition(condition: .onQueue(processQueue))
-        pumpManager = nil
+        let removed = accessLock.withLock {
+            if manager is WalnutPumpManager {
+                guard pumpManagerValue === manager else { return false }
+                rawPumpManager = nil
+                UserDefaults.standard.clearLegacyPumpManagerRawValue()
+            }
+            pumpManagerValue = nil
+            return true
+        }
+        guard removed else { return }
         broadcaster.notify(PumpDeactivatedObserver.self, on: processQueue) {
             $0.pumpDeactivatedDidChange()
         }
@@ -537,7 +604,7 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManager(
-        _: PumpManager,
+        _ manager: PumpManager,
         hasNewPumpEvents events: [NewPumpEvent],
         lastReconciliation _: Date?,
         replacePendingEvents: Bool,
@@ -545,12 +612,17 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     ) {
         dispatchPrecondition(condition: .onQueue(processQueue))
 
+        let isWalnut = manager is WalnutPumpManager
+        guard !isWalnut || pumpManager === manager else {
+            completion(CancellationError())
+            return
+        }
         pumpEventsTask = Task { [previousBatch = pumpEventsTask] in
             await previousBatch?.value
             do {
-                // filter buggy TBRs > maxBasal from MDT
-                let events = events.filter {
-                    // type is optional...
+                // A configured command limit cannot discard Walnut's measured delivery.
+                let events = isWalnut ? events : events.filter {
+                    // Filter invalid TBR history from MDT.
                     guard let type = $0.type, type == .tempBasal else { return true }
                     return $0.dose?.unitsPerHour ?? 0 <= Double(settingsManager.pumpSettings.maxBasal)
                 }
@@ -578,7 +650,7 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
     }
 
     func pumpManager(
-        _: PumpManager,
+        _ manager: PumpManager,
         didReadReservoirValue units: Double,
         at date: Date,
         completion: @escaping (Result<
@@ -587,6 +659,10 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
         >) -> Void
     ) {
         dispatchPrecondition(condition: .onQueue(processQueue))
+        guard !(manager is WalnutPumpManager) || pumpManager === manager else {
+            completion(.failure(CancellationError()))
+            return
+        }
         debug(.deviceManager, "Reservoir Value \(units), at: \(date)")
         storage.save(Decimal(units), as: OpenAPS.Monitor.reservoir)
         broadcaster.notify(PumpReservoirObserver.self, on: processQueue) {

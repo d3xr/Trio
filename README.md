@@ -32,6 +32,17 @@ Over time, Trio aims to work safely for **any** person with diabetes who is will
 
 ---
 
+## Walnut driver
+
+This branch integrates the [Walnut pump driver](https://github.com/d3xr/walnut-driver). Clone it with the pinned submodules and open the workspace in Xcode.
+
+```sh
+git clone --branch walnut --recurse-submodules https://github.com/d3xr/Trio.git
+open Trio/Trio.xcworkspace
+```
+
+Select the `Trio` scheme and build for Simulator. Hardware acceptance is pending.
+
 ## To download this repo:
 
 You can either use the Build Script or you can run each command manually.
